@@ -1,3 +1,5 @@
+// src/types/timetable.ts
+
 export interface ClassConfig {
   name: string;
   selected: boolean;
@@ -25,7 +27,7 @@ export interface TheorySubject {
   code: string;
   year: string;
   weeklyLoad: number;
-  type: 'Theory' | 'Elective'; // Supports Electives
+  type: 'Theory' | 'Elective';
 }
 
 export interface LabSubject {
@@ -34,9 +36,10 @@ export interface LabSubject {
   code: string;
   year: string;
   batchCount: number;
-  labsPerWeek: number;
+  sessionsPerWeek: number;
+  durationPerSession: number;
   isSpecial: boolean;
-  type: 'Lab';
+  type: 'Lab' | 'Tutorial';
 }
 
 export interface CurriculumData {
@@ -80,14 +83,6 @@ export interface ConstraintsData {
   shiftBias: Record<string, 'morning' | 'afternoon'>;
 }
 
-export interface GenerationData {
-  status: 'idle' | 'running' | 'completed' | 'error';
-  progress: number;
-  fitnessScore: number;
-  logs: string[];
-}
-
-// --- NEW: Timetable Structure Types ---
 export interface BackendBatch {
   batch?: string;
   subject: string;
@@ -98,7 +93,8 @@ export interface BackendBatch {
 export interface BackendEntry {
   slot: number;
   duration: number;
-  type: "THEORY" | "LAB" | "PROJECT" | "REMEDIAL" | "ELECTIVE";
+  // UPDATED: Added MATHS_TUT
+  type: "THEORY" | "LAB" | "PROJECT" | "REMEDIAL" | "ELECTIVE" | "TUTORIAL" | "MATHS_TUT";
   subject: string;
   teacher: string;
   room: string;
@@ -109,7 +105,6 @@ export interface ResultsData {
   totalGaps: number;
   unplacedLectures: number;
   fitnessScore: number;
-  // Strongly typed timetable: Division -> Day -> List of Entries
   timetable: Record<string, Record<string, BackendEntry[]>> | null;
 }
 
@@ -121,7 +116,7 @@ export interface TimetableFormData {
   faculty: FacultyData;
   workload: WorkloadData;
   constraints: ConstraintsData;
-  generation: GenerationData;
+  generation: any; 
   results: ResultsData;
 }
 
@@ -164,12 +159,7 @@ export const INITIAL_FORM_DATA: TimetableFormData = {
     homeRoomAssignments: {},
     shiftBias: {},
   },
-  generation: {
-    status: 'idle',
-    progress: 0,
-    fitnessScore: 0,
-    logs: [],
-  },
+  generation: {},
   results: {
     totalGaps: 0,
     unplacedLectures: 0,

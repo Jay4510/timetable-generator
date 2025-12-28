@@ -4,7 +4,12 @@ from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import random
 import copy
-from collections import defaultdict, deque, Counter
+from collections import defaultdict
+import re
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TimetableSolver")
 
 app = FastAPI()
 
@@ -16,88 +21,100 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATA MODELS ---
-class TeacherInput(BaseModel):
-    id: str
-    name: str
-    role: str 
-    experience: int
-    shift: str 
-    skills: List[str]
+# ==========================================
+# 1. INPUT MODELS
+# ==========================================
 
-class SubjectInput(BaseModel):
+class ConfigData(BaseModel):
+    slots_per_day: int
+    recess_index: int
+    days: List[str]
+
+class ResourceData(BaseModel):
+    lab_rooms: List[str]
+    theory_rooms: List[str]
+
+class SubjectData(BaseModel):
     name: str
     code: str
     type: str 
-    weekly_load: int 
-    
-class AllocationInput(BaseModel):
+    weekly_load: int
+    duration: Optional[int] = 1
+
+class FacultyData(BaseModel):
+    id: str
+    name: str
+    role: str
+    experience: int
+    shift: str
+    skills: List[str] = []
+
+class AllocationData(BaseModel):
     teacher_id: str
     subject_name: str
     division: str
 
-class TimetableRequest(BaseModel):
-    config: Dict[str, Any]      
-    resources: Dict[str, Any]   
-    subjects: Dict[str, List[SubjectInput]] 
-    lab_prefs: Dict[str, List[str]]
-    home_rooms: Dict[str, str]  
-    faculty: List[TeacherInput]
-    allocations: List[AllocationInput]
-    divisions: Dict[str, List[str]] 
+class RoomInput(BaseModel):
+    name: str
+    type: str
+    special_assignment: Optional[str] = None
 
-# --- CLASSES ---
+class TimetableRequest(BaseModel):
+    config: ConfigData
+    resources: ResourceData
+    subjects: Dict[str, List[SubjectData]] 
+    lab_prefs: Dict[str, List[str]]
+    home_rooms: Dict[str, str]
+    shift_bias: Dict[str, str] = {}
+    faculty: List[FacultyData]             
+    allocations: List[AllocationData]
+    divisions: Dict[str, List[str]]
+    rooms: List[RoomInput]
+
+# ==========================================
+# 2. CORE CLASSES
+# ==========================================
+
 class Teacher:
-    def __init__(self, data: TeacherInput):
+    def __init__(self, data: FacultyData):
         self.id = data.id
         self.name = data.name
-        self.role = data.role
-        self.experience = data.experience
         self.shift = data.shift
-        self.skills = set(data.skills)
         self.current_load = 0
-        self.theory_load = 0
-        self.lab_load = 0
-        
-        # --- STRICT WORKLOAD LIMITS ---
-        if self.role == "HOD": 
-            self.max_load = 12; self.min_target = 10; self.max_theory = 4; self.max_lab = 8
-        elif self.role == "Div Incharge":
-            self.max_load = 15; self.min_target = 13; self.max_theory = 6; self.max_lab = 10
-        elif self.role == "Faculty" and self.experience >= 10: 
-            self.max_load = 14; self.min_target = 13; self.max_theory = 6; self.max_lab = 8
-        else: 
-            self.max_load = 17; self.min_target = 15; self.max_theory = 9; self.max_lab = 10
+        self.max_load = 20
 
-    def is_available(self, slot):
-        if self.shift == 'A' and slot > 7: return False
-        if self.shift == 'B' and slot < 1: return False
+    def assign_load(self, duration=1):
+        self.current_load += duration
+
+    def is_available(self, slot, total_slots):
+        if self.shift == 'A' and slot >= total_slots - 2: return False
+        if self.shift == 'B' and slot == 0: return False
         return True
     
-    def can_take_load(self, duration, type="THEORY"):
-        if self.current_load + duration > self.max_load: return False
-        if type == "THEORY": return self.theory_load + duration <= self.max_theory
-        else: return self.lab_load + duration <= self.max_lab
+    def __repr__(self): return self.name
 
 class DummyTeacher:
     def __init__(self, id="-1", name="TBA"):
         self.id = id; self.name = name
-        self.current_load = 0; self.theory_load = 0; self.lab_load = 0; self.shift = "ALL"
-    def is_available(self, slot): return True
-    def can_take_load(self, duration, type="THEORY"): return True
+        self.current_load = 0; self.max_load = 999; self.shift = "ALL"
+    def is_available(self, slot, total): return True
+    def assign_load(self, duration=1): pass
 
 class Gene:
-    def __init__(self, div, type, subject, teacher=None, duration=1, lab_subjects=None):
+    def __init__(self, div, type, subject, duration=1, 
+                 teachers_list=None, lab_subjects=None, batch_ids=None):
         self.div = div
-        self.type = type # THEORY, LAB, ELECTIVE
+        self.type = type 
         self.subject = subject 
-        self.lab_subjects = lab_subjects # Used for Labs AND Elective lists
         self.duration = duration
-        self.teacher = teacher 
+        self.teachers_list = teachers_list if teachers_list else []
+        self.lab_subjects = lab_subjects if lab_subjects else [] 
+        self.batch_ids = batch_ids if batch_ids else [] 
         self.day = -1
         self.slot = -1
-        self.assigned_room = []
-        self.assigned_teachers = [] 
+        self.assigned_rooms = []
+
+    def __repr__(self): return f"{self.div}|{self.type}|{self.subject}"
 
 class Schedule:
     def __init__(self, genes, constants):
@@ -106,426 +123,514 @@ class Schedule:
         self.grid = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
         self.div_slots = defaultdict(lambda: defaultdict(list))
         self.teacher_slots = defaultdict(lambda: defaultdict(list))
-        self.div_types = defaultdict(lambda: defaultdict(dict))
-        self.div_rooms = defaultdict(lambda: defaultdict(dict)) 
+        self.div_batch_busy = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+        self.theory_rooms_used = defaultdict(lambda: defaultdict(int))
+        
+        # Enhanced State Tracking
+        self.div_subjects = defaultdict(lambda: defaultdict(lambda: defaultdict(str)))
+        self.div_type_history = defaultdict(lambda: defaultdict(lambda: defaultdict(str)))
+        self.div_daily_count = defaultdict(lambda: defaultdict(int))
 
-    def is_free(self, day, start, duration, div, teachers=None, rooms=None):
-        for s in range(start, start + duration):
-            if s >= self.constants['SLOTS_PER_DAY']: return False
-            if s == self.constants['RECESS_INDEX']: return False 
-            if div and div in self.grid[day][s]['div']: return False
-            if teachers:
-                for t in teachers:
-                    if t is None: continue 
+    def is_free(self, day, start, gene, strict_repetition_check=True):
+        if start + gene.duration > self.constants['SLOTS_PER_DAY']: return False
+        
+        # --- 1. HARD ANTI-REPETITION (Look Both Ways) ---
+        if strict_repetition_check:
+            prev_s = start - 1
+            if prev_s == self.constants['RECESS_INDEX']: prev_s -= 1
+            if prev_s >= 0:
+                prev_sub = self.div_subjects[day][prev_s][gene.div]
+                if prev_sub == gene.subject: return False 
+
+            next_s = start + gene.duration
+            if next_s == self.constants['RECESS_INDEX']: next_s += 1
+            if next_s < self.constants['SLOTS_PER_DAY']:
+                next_sub = self.div_subjects[day][next_s][gene.div]
+                if next_sub == gene.subject: return False
+        # ---------------------------------------------
+
+        for s in range(start, start + gene.duration):
+            if s == self.constants['RECESS_INDEX']: return False
+            
+            for b in gene.batch_ids:
+                busy_batches = self.div_batch_busy[day][s][gene.div]
+                if "ALL" in busy_batches: return False
+                if b == "ALL":
+                    if len(busy_batches) > 0: return False 
+                elif b in busy_batches:
+                    return False
+
+            for t in gene.teachers_list:
+                if t.id != "-1":
                     if t.id in self.grid[day][s]['teacher']: return False
-                    if not t.is_available(s): return False
-            if rooms:
-                for r in rooms:
-                    if r in self.grid[day][s]['room']: return False
+                    if not t.is_available(s, self.constants['SLOTS_PER_DAY']): return False
+
         return True
 
-    def book(self, gene, day, start, rooms, teachers):
+    def book(self, gene, day, start, rooms):
         gene.day = day
         gene.slot = start
-        gene.assigned_room = rooms
-        gene.assigned_teachers = teachers
+        gene.assigned_rooms = rooms
+        
+        self.div_daily_count[gene.div][day] += 1
+        
         for i in range(gene.duration):
             idx = start + i
-            self.grid[day][idx]['div'].add(gene.div)
-            self.div_types[day][gene.div][idx] = gene.type 
-            if rooms: self.div_rooms[day][gene.div][idx] = rooms[0]
-            
-            for t in teachers: 
-                if t and t.id != "-1": 
+            self.div_subjects[day][idx][gene.div] = gene.subject 
+            self.div_type_history[day][idx][gene.div] = gene.type
+
+            for b in gene.batch_ids:
+                self.div_batch_busy[day][idx][gene.div].add(b)
+            for t in gene.teachers_list:
+                if t.id != "-1":
                     self.grid[day][idx]['teacher'].add(t.id)
                     self.teacher_slots[t.id][day].append(idx)
-            for r in rooms: self.grid[day][idx]['room'].add(r)
+            for r in rooms:
+                if r != "TBA": self.grid[day][idx]['room'].add(r)
             self.div_slots[gene.div][day].append(idx)
-    
-    def calculate_gaps(self):
-        total_gaps = 0
-        for div, days_data in self.div_slots.items():
-            for day, slots in days_data.items():
-                if not slots: continue
+            if gene.type in ["THEORY", "ELECTIVE"]:
+                self.theory_rooms_used[day][idx] += len(rooms)
+
+    def calculate_gaps_and_sparse(self):
+        gaps = 0
+        sparse_penalty = 0
+        for div, d_map in self.div_slots.items():
+            for d, slots in d_map.items():
                 slots.sort()
                 valid = [s for s in slots if s != self.constants['RECESS_INDEX']]
                 if len(valid) > 1:
-                    gaps = (max(valid) - min(valid) + 1) - len(valid)
-                    if gaps > 0: total_gaps += gaps
-        return total_gaps
+                    span = valid[-1] - valid[0] + 1
+                    if valid[0] < self.constants['RECESS_INDEX'] < valid[-1]: span -= 1
+                    diff = span - len(valid)
+                    if diff > 0: gaps += diff
+                
+                # --- STRICT SPARSE DAY PENALTY ---
+                daily_count = self.div_daily_count[div][d]
+                if 0 < daily_count < 3: 
+                    sparse_penalty += 1
 
-# --- UTILS ---
-def get_pref_rooms_for_subject(sub_name: str, lab_prefs: Dict[str, List[str]]) -> List[str]:
-    if sub_name in ["Library", "Free"]: return []
-    for key, rooms in lab_prefs.items():
-        if key in sub_name: return rooms
-    return []
+        return gaps, sparse_penalty
 
-def get_lab_resources(schedule, day, start, duration, lab_names, lab_prefs, all_teachers, constants):
-    final_rooms = [None] * 3
-    reserved_rooms = set()
-    for rooms in lab_prefs.values():
-        for r in rooms: reserved_rooms.add(r)
+# ==========================================
+# 3. HELPER FUNCTIONS
+# ==========================================
 
-    # 1. Preferences
-    for i, name in enumerate(lab_names):
-        if name in ["Library", "Free"]: continue
-        matched_rooms = get_pref_rooms_for_subject(name, lab_prefs)
-        if matched_rooms:
-            for r in matched_rooms:
-                if schedule.is_free(day, start, duration, None, rooms=[r]) and r not in final_rooms:
-                    final_rooms[i] = r; break
+def normalize_key(s):
+    return re.sub(r'[^a-zA-Z0-9]', '', s).lower().replace('maths', 'math')
+
+def check_room_free(schedule, day, start, duration, room):
+    for s in range(start, start+duration):
+        if s == schedule.constants['RECESS_INDEX']: return False
+        if room in schedule.grid[day][s]['room']: return False
+    return True
+
+def get_rooms_for_gene(schedule, day, start, gene, resources, home_rooms, special_rooms):
+    needed = len(gene.teachers_list)
+    found_rooms = []
     
-    # 2. General Pool
-    general_pool = [r for r in constants['LAB_ROOMS'] if r not in reserved_rooms]
-    random.shuffle(general_pool)
-    for i in range(3):
-        if final_rooms[i] is None:
-            if lab_names[i] in ["Library", "Free"]: final_rooms[i] = "TBA"
+    # 1. THEORY/ELECTIVE: Try Home Room First
+    if gene.type in ["THEORY", "ELECTIVE"]:
+        if schedule.theory_rooms_used[day][start] + needed > len(resources.theory_rooms): return None
+        pool = list(resources.theory_rooms); random.shuffle(pool)
+        home = home_rooms.get(gene.div)
+        
+        # Priority: Home Room
+        if home and home in pool:
+             if check_room_free(schedule, day, start, gene.duration, home):
+                 pool.remove(home)
+                 pool.insert(0, home)
+
+        for i in range(needed):
+            assigned = None
+            for r in pool:
+                if r not in found_rooms and check_room_free(schedule, day, start, gene.duration, r):
+                    assigned = r; break
+            if assigned: found_rooms.append(assigned)
+            
+    # 2. LABS/TUTS: Strict & Fuzzy Matching
+    else: 
+        reserved_rooms = {r for rooms in special_rooms.values() for r in rooms}
+        lab_pool = [r for r in resources.lab_rooms if r not in reserved_rooms]
+        random.shuffle(lab_pool)
+        theory_pool = list(resources.theory_rooms); random.shuffle(theory_pool)
+        
+        for i in range(needed):
+            sub_name = gene.lab_subjects[i]
+            assigned = None
+            
+            # --- PROJECT/LIBRARY EXCEPTION ---
+            if sub_name == 'PROJECT' or sub_name == 'LIBRARY':
+                # Projects use theory rooms or just placeholder
+                for r in theory_pool:
+                     if r not in found_rooms and check_room_free(schedule, day, start, gene.duration, r):
+                        assigned = r; break
+                if not assigned: assigned = "Location TBA"
             else:
-                for r in general_pool:
-                    if r not in final_rooms and schedule.is_free(day, start, duration, None, rooms=[r]):
-                        final_rooms[i] = r; break
+                norm_sub = normalize_key(sub_name)
+                special_key = next((k for k in special_rooms if normalize_key(k) in norm_sub or norm_sub in normalize_key(k)), None)
+                
+                if special_key:
+                    candidates = special_rooms[special_key]
+                    for r in candidates:
+                        if r not in found_rooms and check_room_free(schedule, day, start, gene.duration, r):
+                            assigned = r; break
+                    if not assigned: return None 
+                else:
+                    pool_to_use = theory_pool if gene.type == "MATHS_TUT" else lab_pool
+                    for r in pool_to_use:
+                        if r not in found_rooms and check_room_free(schedule, day, start, gene.duration, r):
+                            assigned = r; break
+            
+            if assigned: found_rooms.append(assigned)
 
-    if any(r is None for r in final_rooms): return None, None
-    return final_rooms, [] 
-
-def get_elective_resources(schedule, day, start, duration, subject_names, theory_rooms, constants):
-    # Find multiple theory rooms for parallel electives
-    final_rooms = []
-    # Use any available theory room
-    available = [r for r in theory_rooms if schedule.is_free(day, start, duration, None, rooms=[r])]
-    random.shuffle(available)
-    
-    if len(available) >= len(subject_names):
-        return available[:len(subject_names)]
+    if len(found_rooms) == needed: return found_rooms
     return None
 
-def check_soft_constraints(schedule, div, day, slot, gene, constants, proposed_room=None, home_room=None):
+def calculate_cost(schedule, day, slot, gene, constants):
     cost = 0
-    # 1. Subject Repetition
-    for g in schedule.genes:
-        if g.day == day and g.div == div and g.subject == gene.subject and g != gene:
-            return 10000 
+    # 1. GRAVITY (Push classes earlier) - INCREASED WEIGHT
+    cost += slot * 100
+    
+    # 2. BE Morning Preference
+    if "BE" in gene.div and slot >= 4: cost += 50000
 
-    # 2. Teacher Compactness
-    t = gene.teacher
-    if t:
-        teacher_slots = sorted(schedule.teacher_slots[t.id][day])
-        prev_slot = slot - 1; next_slot = slot + 1
-        if prev_slot == constants['RECESS_INDEX']: prev_slot -= 1
-        if next_slot == constants['RECESS_INDEX']: next_slot += 1
-        if prev_slot in teacher_slots: cost -= 1000 
-        if next_slot in teacher_slots: cost -= 1000
-
-    # 3. Nuclear Gap Penalty (50k)
-    existing = schedule.div_slots[div][day]
-    if existing:
-        new_slots = existing + [slot]; new_slots.sort()
-        valid = [s for s in new_slots if s != constants['RECESS_INDEX']]
-        if len(valid) > 1:
-            gaps = (max(valid) - min(valid) + 1) - len(valid)
-            if gaps > 0: cost += (gaps * 50000)
-
-    # 4. Post-Recess Magnet & Morning Anchor
-    if slot == constants['RECESS_INDEX'] + 1: cost -= 100000
-    if slot == 0: cost -= 20000 
-
-    # 5. Student Boredom
-    if gene.type == "THEORY":
-        day_types = schedule.div_types[day][div]
+    # 3. Teacher Fatigue
+    for t in gene.teachers_list:
+        if t.id == "-1": continue
+        t_slots = schedule.teacher_slots[t.id][day]
+        prev, next_s = slot - 1, slot + gene.duration
+        if prev == constants['RECESS_INDEX']: prev -= 1
+        if next_s == constants['RECESS_INDEX']: next_s += 1
         consecutive = 0
-        for s in range(slot - 1, -1, -1):
-            if s == constants['RECESS_INDEX']: continue
-            if day_types.get(s) == "THEORY": consecutive += 1
-            else: break
-        for s in range(slot + 1, constants['SLOTS_PER_DAY']):
-            if s == constants['RECESS_INDEX']: continue
-            if day_types.get(s) == "THEORY": consecutive += 1
-            else: break
-        if consecutive >= 2: cost += 5000 
-        if consecutive >= 3: cost += 10000
+        if prev in t_slots: consecutive += 1
+        if next_s in t_slots: consecutive += 1
+        if consecutive >= 1: cost += 1000
+        if consecutive >= 2: cost += 5000
 
-    # 6. Room Stickiness
-    if proposed_room and home_room:
-        if proposed_room != home_room:
-            if slot < constants['RECESS_INDEX']: cost += 5000
-            else: cost += 500 
+    # 4. Student Gaps & Holes - MASSIVE PENALTY UPDATE
+    current_slots = schedule.div_slots[gene.div][day]
+    if current_slots:
+        all_s = sorted(current_slots + [slot])
+        span = all_s[-1] - all_s[0] + 1
+        if all_s[0] < constants['RECESS_INDEX'] < all_s[-1]: span -= 1
+        actual_gaps = span - len(all_s)
         
-        prev_slot = slot - 1
-        if prev_slot == constants['RECESS_INDEX']: prev_slot -= 1
-        prev_room = schedule.div_rooms[day][div].get(prev_slot)
-        if prev_room:
-            if prev_room != proposed_room: cost += 2000
-            else: cost -= 500
-            
-    # 7. Elective Placement (Start/End Preference)
+        # Penalize gaps severely to force compactness
+        if actual_gaps > 0: cost += 50000 
+        else: cost -= 1000 # Reward perfect stacking
+
+    # 5. Type-Specific Preferences
     if gene.type == "ELECTIVE":
-        last_slot = constants['SLOTS_PER_DAY'] - 1
-        if slot not in [0, last_slot, last_slot-1]:
-            cost += 5000 
+        if slot == 0: cost -= 50000 
+        elif slot > 1: cost += 50000 
+
+    if gene.type == "MATHS_TUT":
+        if slot >= constants['SLOTS_PER_DAY'] - 2: cost -= 100000 
+        elif slot < 5: cost += 50000 
+
+    if gene.type == "THEORY":
+        prev1 = slot - 1
+        if prev1 == constants['RECESS_INDEX']: prev1 -= 1
+        prev2 = prev1 - 1
+        if prev2 == constants['RECESS_INDEX']: prev2 -= 1
+        if prev1 >= 0 and prev2 >= 0:
+            t1 = schedule.div_type_history[day][prev1][gene.div]
+            t2 = schedule.div_type_history[day][prev2][gene.div]
+            if t1 == "THEORY" and t2 == "THEORY":
+                cost += 5000 
+
+    if gene.type == "LAB":
+        busy_batches = schedule.div_batch_busy[day][slot][gene.div]
+        if busy_batches: cost -= 5000 # Increased reward for parallel labs
+
+    # 6. Anti-Repeat (Soft Backup)
+    prev_s = slot - 1
+    if prev_s == constants['RECESS_INDEX']: prev_s -= 1
+    if prev_s >= 0:
+        prev_sub = schedule.div_subjects[day][prev_s][gene.div]
+        if prev_sub == gene.subject: cost += 100000
 
     return cost
 
-def atomic_allocate_teacher(all_teachers, subject_name, total_weekly_load, allocation_map, division, type="THEORY"):
-    assigned_id = next((a.teacher_id for a in allocation_map if a.subject_name == subject_name and a.division == division), None)
-    if assigned_id:
-        t = next((x for x in all_teachers if x.id == assigned_id), None)
-        if t: return t
-
-    candidates = [t for t in all_teachers if t.can_take_load(total_weekly_load, type)]
-    skilled = [t for t in candidates if subject_name in t.skills]
-    pool = skilled if skilled else candidates
-    
-    if pool:
-        pool.sort(key=lambda x: (x.current_load >= x.min_target, x.current_load))
-        return pool[0]
-    
-    fallback = [t for t in all_teachers if t.can_take_load(total_weekly_load, type)]
-    if fallback:
-        fallback.sort(key=lambda x: x.current_load)
-        return fallback[0]
-
-    return DummyTeacher()
-
-@app.post("/generate-timetable")
-async def generate_timetable(req: TimetableRequest):
-    PROJECT_RESERVATIONS = {
-        "BE-A": {"Fri": [0, 1, 2, 3, 5, 6, 7]}, 
-        "BE-B": {"Thu": [0, 1, 2, 3, 5, 6, 7]},
-        "TE-A": {"Wed": [5, 6, 7]},
-        "TE-B": {"Tue": [5, 6, 7]}
-    }
+def solve(genes, config, resources, home_rooms, special_rooms):
+    logger.info("--- Starting Solver (FORCEFUL COMPLETION MODE) ---")
+    best_sched = None
+    best_score = -float('inf')
     
     CONSTANTS = {
-        'SLOTS_PER_DAY': req.config.get('slots_per_day', 9),
-        'RECESS_INDEX': req.config.get('recess_index', 4),
-        'LAB_ROOMS': req.resources.get('lab_rooms', []),
-        'THEORY_ROOMS': req.resources.get('theory_rooms', [])
+        'SLOTS_PER_DAY': config.slots_per_day,
+        'RECESS_INDEX': 4 
     }
-    
-    teacher_map = {t.id: Teacher(t) for t in req.faculty}
-    all_teachers = list(teacher_map.values())
-    all_genes = []
-    global_subject_assignments = {}
 
-    # --- WORKLOAD GENERATION ---
-    for year, divs in req.divisions.items():
-        year_subjects = req.subjects.get(year, [])
-        for div in divs:
-            
-            # 1. Separate Electives vs Normal Theory
-            normal_theory = [s for s in year_subjects if s.type == 'Theory']
-            electives = [s for s in year_subjects if s.type == 'Elective'] 
-            
-            # A. Process Normal Theory
-            for sub in normal_theory:
-                if "Project" in sub.name: continue 
-                
-                assignment_key = (div, sub.name)
-                if assignment_key not in global_subject_assignments:
-                    t = atomic_allocate_teacher(all_teachers, sub.name, sub.weekly_load, req.allocations, div, "THEORY")
-                    if t.id != "-1": 
-                        t.current_load += sub.weekly_load
-                        t.theory_load += sub.weekly_load
-                    global_subject_assignments[assignment_key] = t
-                
-                teacher = global_subject_assignments[assignment_key]
-                for _ in range(sub.weekly_load):
-                    all_genes.append(Gene(div, "THEORY", sub.name, teacher=teacher))
-            
-            # B. Process Electives (Bundled)
-            if electives:
-                load = electives[0].weekly_load
-                elec_names = []
-                elec_teachers = []
-                
-                # Pre-allocate for all electives
-                for e in electives:
-                    elec_names.append(e.name)
-                    t = atomic_allocate_teacher(all_teachers, e.name, load, req.allocations, div, "THEORY")
-                    if t.id != "-1":
-                        t.current_load += load
-                        t.theory_load += load
-                    elec_teachers.append(t)
+    # IMPORTANT: Shuffle genes slightly to prevent SE-A from always being last/worst
+    # But keep the Type priority (Lab > Tut > Theory)
+    random.shuffle(genes) 
+    genes.sort(key=lambda g: 0 if g.type == "LAB" else (1 if g.type == "MATHS_TUT" else (2 if g.type == "ELECTIVE" else 3)))
 
-                for _ in range(load):
-                    g = Gene(div, "ELECTIVE", "Elective Block", duration=1, lab_subjects=elec_names)
-                    g.assigned_teachers = elec_teachers
-                    all_genes.append(g)
+    TOTAL_BATCHES = 3 
 
-            # 2. Labs
-            lab_subs = [s for s in year_subjects if s.type == 'Lab']
-            if lab_subs:
-                valid_labs = [s for s in lab_subs if "Project" not in s.name]
-                master_tokens = []
-                for sub in valid_labs:
-                    sessions = max(1, int(sub.weekly_load / 2))
-                    for _ in range(sessions): master_tokens.append(sub.name)
-                
-                random.shuffle(master_tokens)
-                n = len(master_tokens)
-                if n > 0:
-                    shift = n // 3 if n >= 3 else 1
-                    q1 = list(master_tokens)
-                    q2 = master_tokens[shift:] + master_tokens[:shift]
-                    q3 = master_tokens[2*shift:] + master_tokens[:2*shift]
-                    
-                    for i in range(n):
-                        triplet = [q1[i], q2[i], q3[i]]
-                        lab_gene = Gene(div, "LAB", "Lab Session", duration=2, lab_subjects=triplet)
-                        
-                        assigned_teachers = []
-                        for sub_name in triplet:
-                            if sub_name == "Library" or sub_name == "Free":
-                                assigned_teachers.append(None)
-                            else:
-                                t = atomic_allocate_teacher(all_teachers, sub_name, 2, req.allocations, div, "LAB")
-                                if t.id != "-1": 
-                                    t.current_load += 2
-                                    t.lab_load += 2 
-                                assigned_teachers.append(t)
-                        
-                        lab_gene.assigned_teachers = assigned_teachers
-                        all_genes.append(lab_gene)
-
-    best_schedule = None
-    best_score = -float('inf')
-    best_gaps = float('inf')
-
-    for run in range(100): 
-        schedule = Schedule(copy.deepcopy(all_genes), CONSTANTS)
+    # INCREASED ITERATIONS for difficult constraints
+    for run in range(5000): 
+        schedule = Schedule(copy.deepcopy(genes), CONSTANTS)
+        unplaced = []
         
-        # Pre-Book Projects
-        for div, days_map in PROJECT_RESERVATIONS.items():
-            for day_name, slots in days_map.items():
-                if day_name not in req.config['days']: continue
-                d_idx = req.config['days'].index(day_name)
-                for s in slots:
-                    if schedule.is_free(d_idx, s, 1, div):
-                        proj_gene = Gene(div, "PROJECT", "Major Project", duration=1)
-                        proj_gene.assigned_room = ["Project Lab"]
-                        proj_gene.assigned_teachers = [DummyTeacher(id="-1", name="Guide")]
-                        schedule.book(proj_gene, d_idx, s, ["Project Lab"], proj_gene.assigned_teachers)
+        # PANIC MODE starts earlier to force completion
+        panic_mode = run > 1500
+        strict_rep = run < 2500
 
-        # 1. Place Labs
-        labs = [g for g in schedule.genes if g.type == "LAB"]
-        random.shuffle(labs)
-        for g in labs:
-            placed = False
-            days = list(range(len(req.config['days']))); random.shuffle(days)
-            has_library = any(sub == "Library" for sub in g.lab_subjects)
-            if has_library: starts = [0, 7, 1, 6, 5, 2] 
-            else: starts = [5, 7, 0, 2]
-            
-            for d in days:
-                for s in starts:
-                    if schedule.is_free(d, s, 2, g.div, teachers=g.assigned_teachers):
-                        rooms, _ = get_lab_resources(schedule, d, s, 2, g.lab_subjects, req.lab_prefs, all_teachers, CONSTANTS)
-                        if rooms:
-                            schedule.book(g, d, s, rooms, g.assigned_teachers)
-                            placed = True; break
-                if placed: break
-
-        # 2. Place Theory (Includes Electives)
-        theories = [g for g in schedule.genes if g.type in ["THEORY", "ELECTIVE"]]
-        random.shuffle(theories)
-        
-        for g in theories:
-            teachers_check = g.assigned_teachers if g.type == "ELECTIVE" else [g.teacher]
-            best_cost = float('inf')
+        for g in genes:
             best_move = None
+            min_cost = float('inf')
             
-            home = req.home_rooms.get(g.div, req.resources['theory_rooms'][0])
-            days = list(range(len(req.config['days']))); random.shuffle(days)
+            days = list(range(len(config.days))); random.shuffle(days)
+            all_slots = list(range(config.slots_per_day))
             
+            valid_starts = []
+            if g.duration == 2:
+                # Split Labs -> Late Afternoon preference
+                if len(g.batch_ids) < TOTAL_BATCHES:
+                    priority = [5, 6, 7] 
+                    others = [s for s in all_slots if s not in priority and s != 3 and s != 4 and s+1 != 4 and s+2 <= config.slots_per_day]
+                    random.shuffle(priority); random.shuffle(others)
+                    valid_starts = priority + others
+                else:
+                    valid_starts = [s for s in all_slots if s != 3 and s != 4 and s + 1 != 4 and s + 2 <= config.slots_per_day]
+                    random.shuffle(valid_starts)
+
+            elif g.type == "MATHS_TUT":
+                late = [7, 8, 6]; random.shuffle(late)
+                others = [s for s in all_slots if s not in late and s != 3 and s != 4]
+                random.shuffle(others)
+                valid_starts = late + others
+            elif g.type == "ELECTIVE":
+                early = [0, 1]
+                others = [s for s in all_slots if s not in early and s != 3 and s != 4]
+                random.shuffle(others)
+                valid_starts = early + others
+            else:
+                gap_filler = [3]
+                others = [s for s in all_slots if s != 3 and s != 4]
+                random.shuffle(others)
+                valid_starts = gap_filler + others
+
             for d in days:
-                if any(x.day == d and x.subject == g.subject for x in schedule.genes if x.div == g.div): continue
-                
-                possible_slots = list(range(CONSTANTS['SLOTS_PER_DAY']))
-                possible_slots.sort(key=lambda s: 0 if s in [CONSTANTS['RECESS_INDEX'] + 1, 0] else 1)
-
-                for s in possible_slots:
-                    chosen_rooms = []
-                    if g.type == "ELECTIVE":
-                        chosen_rooms = get_elective_resources(schedule, d, s, 1, g.lab_subjects, req.resources['theory_rooms'], CONSTANTS)
-                        if not chosen_rooms: continue 
-                    else:
-                        if schedule.is_free(d, s, 1, g.div, teachers=teachers_check, rooms=[home]):
-                            chosen_rooms = [home]
-                        else:
-                            for r in req.resources['theory_rooms']:
-                                if r != home and schedule.is_free(d, s, 1, g.div, teachers=teachers_check, rooms=[r]):
-                                    chosen_rooms = [r]; break
-                    
-                    if chosen_rooms:
-                        if schedule.is_free(d, s, 1, g.div, teachers=teachers_check, rooms=chosen_rooms):
-                            chk_room = chosen_rooms[0] if chosen_rooms else None
-                            cost = check_soft_constraints(schedule, g.div, d, s, g, CONSTANTS, proposed_room=chk_room, home_room=home)
-                            if cost < best_cost:
-                                best_cost = cost
-                                best_move = (d, s, chosen_rooms)
-                            if cost < -10000: break 
-
-                if best_cost < -50000: break
-
+                for s in valid_starts:
+                    if schedule.is_free(d, s, g, strict_repetition_check=strict_rep):
+                        rooms = get_rooms_for_gene(schedule, d, s, g, resources, home_rooms, special_rooms)
+                        if rooms:
+                            cost = calculate_cost(schedule, d, s, g, CONSTANTS)
+                            if cost < min_cost:
+                                min_cost = cost
+                                best_move = (d, s, rooms)
+                                if panic_mode: break 
+                                if cost <= -100000: break 
+                if best_move and (panic_mode or min_cost <= -100000): break
+            
             if best_move:
-                d, s, rms = best_move
-                schedule.book(g, d, s, rms, teachers_check)
-
-        unplaced = sum(1 for g in schedule.genes if g.day == -1)
-        gaps = schedule.calculate_gaps()
-        score = 1000000 - (unplaced * 100000) - (gaps * 50000)
+                schedule.book(g, best_move[0], best_move[1], best_move[2])
+            else:
+                unplaced.append(g)
+        
+        score = 1000000
+        # MASSIVE PENALTY FOR UNPLACED to force completion
+        score -= (len(unplaced) * 100000000) 
+        
+        gaps, sparse_days = schedule.calculate_gaps_and_sparse()
+        # HEAVIER GAP PENALTY
+        score -= (gaps * 100000)
+        score -= (sparse_days * 300000) 
+        
+        if run % 500 == 0: 
+            logger.info(f"Run {run}: Score={score} Unplaced={len(unplaced)} Gaps={gaps} Sparse={sparse_days}")
         
         if score > best_score:
             best_score = score
-            best_schedule = schedule
-            best_gaps = gaps
-
-    output = {}
-    if best_schedule:
-        for g in best_schedule.genes:
-            if g.day == -1: continue
-            div_key = g.div
-            day_key = req.config['days'][g.day]
-            if div_key not in output: output[div_key] = {}
-            if day_key not in output[div_key]: output[div_key][day_key] = []
+            best_sched = schedule
+            if len(unplaced) == 0 and gaps <= 3 and sparse_days == 0: 
+                break
             
-            if g.type == "ELECTIVE":
-                entry = {
-                    "slot": g.slot,
-                    "duration": g.duration,
-                    "type": "ELECTIVE",
-                    "subject": " / ".join(g.lab_subjects),
-                    "room": " / ".join(g.assigned_room),
-                    "teacher": " / ".join([t.name for t in g.assigned_teachers if t])
-                }
-            else:
-                t_name = "TBA"
-                if g.type == "THEORY" and g.teacher: t_name = g.teacher.name
-                elif g.assigned_teachers and g.assigned_teachers[0]: t_name = g.assigned_teachers[0].name
+    return best_sched
 
-                entry = {
-                    "slot": g.slot,
-                    "duration": g.duration,
-                    "type": g.type,
-                    "subject": g.subject,
-                    "room": g.assigned_room[0] if g.assigned_room else "TBA",
-                    "teacher": t_name
-                }
+# ==========================================
+# 4. API ENDPOINT
+# ==========================================
+
+@app.post("/generate-timetable")
+async def generate_timetable(req: TimetableRequest):
+    teachers_map = {t.id: Teacher(t) for t in req.faculty}
+    special_rooms = defaultdict(list)
+    for r in req.rooms:
+        if r.special_assignment:
+            special_rooms[r.special_assignment].append(r.name)
+
+    genes = []
+    all_subjects_flat = []
+    for year_list in req.subjects.values():
+        all_subjects_flat.extend(year_list)
+
+    div_allocs = defaultdict(lambda: defaultdict(list))
+    
+    for alloc in req.allocations:
+        if not alloc.teacher_id: continue
+        parts = alloc.division.split('-')
+        
+        if len(parts) >= 3: 
+            base_div = f"{parts[0]}-{parts[1]}"
+            batch_id = parts[2].replace(parts[1], '') 
+            div_allocs[base_div]['LABS'].append({
+                'batch': batch_id, 'subject': alloc.subject_name, 'teacher_id': alloc.teacher_id
+            })
+        elif re.search(r"\d$", alloc.division): 
+            base_div = alloc.division[:-1]; batch_id = alloc.division[-1]
+            div_allocs[base_div]['LABS'].append({
+                'batch': batch_id, 'subject': alloc.subject_name, 'teacher_id': alloc.teacher_id
+            })
+        else: 
+            div_allocs[alloc.division]['THEORY'].append({
+                'subject': alloc.subject_name, 'teacher_id': alloc.teacher_id
+            })
+
+    for div, types in div_allocs.items():
+        # A. LABS & TUTORIALS
+        lab_entries = types['LABS']
+        batch_buckets = defaultdict(list)
+        for entry in lab_entries:
+            batch_buckets[entry['batch']].append(entry)
             
-            if g.type == "LAB":
-                entry["batches"] = []
-                for i, sub in enumerate(g.lab_subjects):
-                    b_teacher = "TBA"
-                    if i < len(g.assigned_teachers) and g.assigned_teachers[i]:
-                        b_teacher = g.assigned_teachers[i].name
-                    b_room = "TBA"
-                    if i < len(g.assigned_room) and g.assigned_room[i]: b_room = g.assigned_room[i]
-                    entry["batches"].append({
-                        "subject": sub, "room": b_room, "teacher": b_teacher, "batch": f"B{i+1}"
-                    })
+        dur1_groups = defaultdict(list)
+        dur2_groups = defaultdict(list)
+        
+        for b_id, entries in batch_buckets.items():
+            for entry in entries:
+                s_info = next((s for s in all_subjects_flat if s.name == entry['subject']), None)
+                if not s_info and not entry['subject'].lower().endswith('tut'): 
+                    continue 
+
+                dur = 2
+                if s_info:
+                    if s_info.type == "Tutorial" or s_info.weekly_load == 1: dur = 1
+                    elif s_info.type == "Lab": dur = s_info.duration if s_info.duration else 2
                 
-            output[div_key][day_key].append(entry)
+                if entry['subject'].lower().endswith('tut'): dur = 1
+                
+                if dur == 1: dur1_groups[b_id].append(entry)
+                else: dur2_groups[b_id].append(entry)
+
+        # 1. LABS (2H) - SMART CHUNKING
+        batch_keys = sorted(dur2_groups.keys())
+        if batch_keys:
+            unique_lab_subjects = set()
+            for b_k in batch_keys:
+                for entry in dur2_groups[b_k]:
+                    unique_lab_subjects.add(entry['subject'])
+            
+            capacity = len(unique_lab_subjects) 
+            if capacity == 0: capacity = 1 
+
+            max_len = max(len(dur2_groups[k]) for k in batch_keys)
+            
+            for i in range(max_len):
+                current_step_allocations = []
+                for k_idx, b_key in enumerate(batch_keys):
+                    items = dur2_groups[b_key]
+                    if not items: continue
+                    item_idx = (i + k_idx) % len(items)
+                    entry = items[item_idx]
+                    current_step_allocations.append({
+                        'batch': b_key,
+                        'subject': entry['subject'],
+                        'teacher': teachers_map.get(entry['teacher_id'], DummyTeacher())
+                    })
+
+                # Slice chunks based on available labs
+                for chunk_start in range(0, len(current_step_allocations), capacity):
+                    chunk = current_step_allocations[chunk_start : chunk_start + capacity]
+                    
+                    if chunk:
+                        g_subs = [x['subject'] for x in chunk]
+                        g_batches = [x['batch'] for x in chunk]
+                        g_teachers = [x['teacher'] for x in chunk]
+                        
+                        genes.append(Gene(div, "LAB", "Session", duration=2,
+                                 teachers_list=g_teachers, 
+                                 lab_subjects=g_subs, 
+                                 batch_ids=g_batches))
+
+        # 2. TUTORIALS (1H)
+        for b_id, items in dur1_groups.items():
+            for entry in items:
+                t = teachers_map.get(entry['teacher_id'], DummyTeacher())
+                genes.append(Gene(div, "MATHS_TUT", entry['subject'], duration=1,
+                                  teachers_list=[t], lab_subjects=[entry['subject']], batch_ids=[entry['batch']]))
+
+        # B. THEORY
+        electives = defaultdict(list)
+        theory_list = []
+        for item in types['THEORY']:
+            s_info = next((s for s in all_subjects_flat if s.name == item['subject']), None)
+            if not s_info: continue
+            t = teachers_map.get(item['teacher_id'], DummyTeacher())
+            t.assign_load(s_info.weekly_load)
+            if s_info.type == "Elective": electives[item['subject']].append(t)
+            else: theory_list.append((item['subject'], t, s_info))
+        
+        for sub_name, teacher, s_info in theory_list:
+            for _ in range(s_info.weekly_load):
+                genes.append(Gene(div, "THEORY", sub_name, duration=1, 
+                                  teachers_list=[teacher], batch_ids=["ALL"]))
+        
+        if electives:
+            max_load = 0
+            elec_subjects = list(electives.keys())
+            elec_teachers = []
+            for sub in elec_subjects:
+                s_info = next((s for s in all_subjects_flat if s.name == sub), None)
+                load = s_info.weekly_load if s_info else 3
+                max_load = max(max_load, load)
+                elec_teachers.append(electives[sub][0])
+            for _ in range(max_load):
+                g = Gene(div, "ELECTIVE", "Elective Block", duration=1,
+                         teachers_list=elec_teachers, lab_subjects=elec_subjects, batch_ids=["ALL"])
+                genes.append(g)
+
+    # --- RUN SOLVER ---
+    schedule = solve(genes, req.config, req.resources, req.home_rooms, special_rooms)
+    
+    if not schedule:
+        raise HTTPException(status_code=500, detail="Unable to generate schedule")
+
+    output = defaultdict(lambda: defaultdict(list))
+    days_lookup = req.config.days
+    
+    for g in schedule.genes:
+        if g.day == -1: continue
+        entry = {
+            "slot": g.slot, "duration": g.duration, "type": g.type, "subject": g.subject,
+            "teacher": "TBA", "room": "TBA"
+        }
+        
+        if g.type in ["LAB", "MATHS_TUT"]:
+            entry["batches"] = []
+            for i, sub in enumerate(g.lab_subjects):
+                t_name = g.teachers_list[i].name if i < len(g.teachers_list) else "TBA"
+                r_name = g.assigned_rooms[i] if i < len(g.assigned_rooms) else "TBA"
+                b_id = g.batch_ids[i] if i < len(g.batch_ids) else "?"
+                entry["batches"].append({
+                    "batch": f"B{b_id}", "subject": sub, "teacher": t_name, "room": r_name
+                })
+            entry["subject"] = " / ".join(set(g.lab_subjects))
+            entry["teacher"] = "Multiple"
+            entry["room"] = "Multiple"
+            
+        elif g.type == "ELECTIVE":
+            entry["subject"] = " / ".join(g.lab_subjects)
+            entry["teacher"] = " / ".join([t.name for t in g.teachers_list])
+            entry["room"] = " / ".join(g.assigned_rooms)
+            
+        else: # THEORY
+            entry["teacher"] = g.teachers_list[0].name
+            entry["room"] = g.assigned_rooms[0]
+            
+        output[g.div][days_lookup[g.day]].append(entry)
 
     return output

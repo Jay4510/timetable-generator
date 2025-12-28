@@ -32,22 +32,29 @@ export const Step8Generation = ({
     
     activeClasses.forEach(year => {
       subjectsMap[year] = [];
-      // Theory
+      
+      // Theory & Electives
       curriculum.theorySubjects.filter(s => s.year === year).forEach(s => {
         subjectsMap[year].push({
           name: s.name,
           code: s.code,
-          type: "Theory",
-          weekly_load: s.weeklyLoad
+          type: s.type, // "Theory" or "Elective"
+          weekly_load: s.weeklyLoad,
+          duration: 1 // Default duration for theory is 1 slot
         });
       });
-      // Labs
+
+      // Labs & Tutorials
       curriculum.labSubjects.filter(s => s.year === year).forEach(s => {
         subjectsMap[year].push({
           name: s.name,
           code: s.code,
-          type: "Lab",
-          weekly_load: s.labsPerWeek * 2 // Backend calculates load in slots (2 slots per session)
+          type: s.type, // "Lab" or "Tutorial"
+          // Calculate total slots needed per week: sessions * duration per session
+          weekly_load: s.sessionsPerWeek * s.durationPerSession,
+          duration: s.durationPerSession, // e.g. 2 for Labs, 1 for Tuts
+          batch_count: s.batchCount,
+          is_special: s.isSpecial
         });
       });
     });
@@ -59,29 +66,24 @@ export const Step8Generation = ({
         if (teacherId) {
           flatAllocations.push({
             teacher_id: teacherId,
-            subject_name: alloc.subjectName,
+            subject_name: alloc.subjectName, // This matches 'name' in subjectsMap
             division: div
           });
         }
       });
     });
 
-    // 3. Lab Preferences (Constraint)
-    const labPrefs: Record<string, string[]> = constraints.labEquipmentMapping;
-
-    // 4. Divisions Mapping
+    // 3. Divisions Mapping (e.g. SE -> [SE-A, SE-B])
     const divisionsMap: Record<string, string[]> = {};
     welcome.classes.filter(c => c.selected).forEach(c => {
       divisionsMap[c.name] = Array.from({length: c.divisions}, (_, i) => `${c.name}-${String.fromCharCode(65+i)}`);
     });
 
-    // PAYLOAD
+    // PAYLOAD CONSTRUCTION
     return {
       config: {
         slots_per_day: timing.totalSlots,
-        recess_index: timing.recessAfterSlot, 
-        // Note: Python script logic uses strict index mapping.
-        // If Python uses 0-based range, and user says "Recess after slot 4", we pass 4.
+        recess_index: timing.recessAfterSlot - 1, // Convert 1-based UI to 0-based Backend index
         days: timing.workingDays
       },
       resources: {
@@ -89,18 +91,33 @@ export const Step8Generation = ({
         theory_rooms: infrastructure.theoryRooms
       },
       subjects: subjectsMap,
-      lab_prefs: labPrefs,
+      lab_prefs: constraints.labEquipmentMapping,
       home_rooms: constraints.homeRoomAssignments,
+      shift_bias: constraints.shiftBias,
+      
       faculty: faculty.faculty.map(f => ({
         id: f.id,
         name: f.name,
         role: f.role,
         experience: f.experience,
-        shift: f.shift === '9-5' ? 'A' : 'B', // Map to Python's expected 'A'/'B'
-        skills: [] // Optional
+        shift: f.shift === '9-5' ? '9-5' : '10-6' 
       })),
+      
       allocations: flatAllocations,
-      divisions: divisionsMap
+      divisions: divisionsMap,
+      
+      // Pass room details for special assignments
+      rooms: [
+        ...infrastructure.theoryRooms.map(r => ({ name: r, type: 'Classroom' })),
+        ...infrastructure.labRooms.map(r => ({ 
+            name: r, 
+            type: 'Lab',
+            // Check if this room is assigned to any special lab subject
+            special_assignment: Object.keys(infrastructure.specialAssignments).find(
+                key => infrastructure.specialAssignments[key] === r
+            ) 
+        }))
+      ]
     };
   };
 
@@ -111,7 +128,7 @@ export const Step8Generation = ({
 
     try {
       const payload = transformDataForBackend();
-      console.log("Sending Payload:", JSON.stringify(payload, null, 2));
+      console.log("Sending Payload:", JSON.stringify(payload, null, 2)); // Debugging log
 
       const response = await fetch('http://localhost:8000/generate-timetable', {
         method: 'POST',
@@ -120,7 +137,8 @@ export const Step8Generation = ({
       });
 
       if (!response.ok) {
-        throw new Error(`Server Error: ${response.statusText}`);
+        const errText = await response.text();
+        throw new Error(`Server Error: ${errText}`);
       }
 
       setLogs(prev => [...prev, "Algorithm Running... (Genetic Evolution in progress)", "Optimizing fitness score..."]);
@@ -133,7 +151,7 @@ export const Step8Generation = ({
       onResultsUpdate({
         totalGaps: 0, 
         unplacedLectures: 0, 
-        fitnessScore: 9500, // Dummy score
+        fitnessScore: 9500, // Dummy score or return from backend
         timetable: result
       });
 
@@ -168,7 +186,7 @@ export const Step8Generation = ({
         <h2 className="text-3xl font-display font-bold mb-2">Ready to Generate</h2>
         <p className="text-muted-foreground max-w-md mx-auto">
           We have collected all configuration, curriculum, and constraints. 
-          The V66 Genetic Algorithm will now attempt to find the optimal schedule.
+          The Genetic Algorithm will now attempt to find the optimal schedule.
         </p>
       </div>
 
@@ -194,7 +212,7 @@ export const Step8Generation = ({
       {error && (
         <div className="max-w-xl mx-auto mt-8 p-4 rounded-lg bg-red-50 text-red-600 border border-red-200 flex items-center gap-3">
           <AlertTriangle className="w-5 h-5" />
-          <p>{error}</p>
+          <p className="flex-1 text-sm">{error}</p>
           <Button variant="outline" size="sm" onClick={() => setError(null)} className="ml-auto border-red-200 hover:bg-red-100">
             Retry
           </Button>

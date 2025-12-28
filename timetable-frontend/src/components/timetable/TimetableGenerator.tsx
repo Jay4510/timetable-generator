@@ -7,7 +7,7 @@ import { Step2Timing } from './steps/Step2Timing';
 import { Step3Curriculum } from './steps/Step3Curriculum';
 import { Step4Infrastructure } from './steps/Step4Infrastructure';
 import { Step5Faculty } from './steps/Step5Faculty';
-import { Step6Workload } from './steps/Step6Workload';
+// Step 6 removed (merged into 5)
 import { Step7Constraints } from './steps/Step7Constraints';
 import { Step8Generation } from './steps/Step8Generation';
 import { Step9Results } from './steps/Step9Results';
@@ -17,11 +17,10 @@ const STEPS = [
   { number: 2, title: 'Timing', subtitle: 'Grid Config' },
   { number: 3, title: 'Curriculum', subtitle: 'Subjects & Labs' },
   { number: 4, title: 'Infrastructure', subtitle: 'Rooms Setup' },
-  { number: 5, title: 'Faculty', subtitle: 'Directory' },
-  { number: 6, title: 'Workload', subtitle: 'Allocations' },
-  { number: 7, title: 'Constraints', subtitle: 'Preferences' },
-  { number: 8, title: 'Generate', subtitle: 'Process' },
-  { number: 9, title: 'Results', subtitle: 'Download' },
+  { number: 5, title: 'Faculty', subtitle: 'Directory & Allocations' }, // Merged Step
+  { number: 6, title: 'Constraints', subtitle: 'Preferences' }, // Was 7
+  { number: 7, title: 'Generate', subtitle: 'Process' }, // Was 8
+  { number: 8, title: 'Results', subtitle: 'Download' }, // Was 9
 ];
 
 export const TimetableGenerator = () => {
@@ -36,7 +35,7 @@ export const TimetableGenerator = () => {
   };
 
   const goToNextStep = () => {
-    if (currentStep < 9) {
+    if (currentStep < 8) { // Updated max steps to 8
       setCurrentStep(currentStep + 1);
     }
   };
@@ -70,20 +69,19 @@ export const TimetableGenerator = () => {
       case 4:
         return <Step4Infrastructure data={formData.infrastructure} labSubjects={formData.curriculum.labSubjects} onUpdate={(data) => updateFormData('infrastructure', data)} />;
       case 5:
-        return <Step5Faculty data={formData.faculty} onUpdate={(data) => updateFormData('faculty', data)} />;
-      case 6:
         return (
-          <Step6Workload 
-            data={formData.workload} 
-            faculty={formData.faculty.faculty} 
+          <Step5Faculty 
+            data={formData.faculty} 
+            workload={formData.workload}
             curriculum={formData.curriculum}
-            welcomeData={formData.welcome} 
-            onUpdate={(data) => updateFormData('workload', data)} 
+            welcome={formData.welcome}
+            onUpdate={(data) => updateFormData('faculty', data)} 
+            onUpdateWorkload={(data) => updateFormData('workload', data)}
           />
         );
-      case 7:
+      case 6: // Formerly Step 7
         return <Step7Constraints data={formData.constraints} welcomeData={formData.welcome} labSubjects={formData.curriculum.labSubjects} infrastructure={formData.infrastructure} onUpdate={(data) => updateFormData('constraints', data)} />;
-      case 8:
+      case 7: // Formerly Step 8
         return (
           <Step8Generation
             data={formData.generation}
@@ -93,8 +91,7 @@ export const TimetableGenerator = () => {
             onGenerate={handleGenerate}
           />
         );
-      case 9:
-        // FIX: Passing 'faculty' and 'infrastructure' solves the TS error and White Screen
+      case 8: // Formerly Step 9
         return (
           <Step9Results 
             data={formData.results} 
@@ -134,14 +131,14 @@ export const TimetableGenerator = () => {
       <main className="container max-w-5xl mx-auto px-4 py-8">
         <div className="elegant-card overflow-hidden">
           {renderStep()}
-          {currentStep < 9 && (
+          {currentStep < 8 && (
             <div className="px-8 pb-8">
               <StepNavigation
                 currentStep={currentStep}
-                totalSteps={9}
+                totalSteps={8}
                 onPrevious={goToPreviousStep}
                 onNext={goToNextStep}
-                nextLabel={currentStep === 8 ? 'View Results' : 'Continue'}
+                nextLabel={currentStep === 7 ? 'View Results' : 'Continue'}
               />
             </div>
           )}

@@ -20,13 +20,21 @@ export const Step2Timing = ({ data, onUpdate }: Step2TimingProps) => {
     onUpdate({ ...data, workingDays: updatedDays });
   };
 
-  // Helper to calculate time strings
   const calculateTime = (startStr: string, minutesToAdd: number) => {
+    if (!startStr) return '00:00';
     const [h, m] = startStr.split(':').map(Number);
     const totalMins = h * 60 + m + minutesToAdd;
     const newH = Math.floor(totalMins / 60);
     const newM = totalMins % 60;
-    return `${newH.toString().padStart(2, '0')}:${newM.toString().padStart(2, '0')}`;
+    const displayH = newH > 12 ? newH - 12 : newH;
+    const ampm = newH >= 12 ? 'PM' : 'AM';
+    return `${displayH}:${newM.toString().padStart(2, '0')} ${ampm}`;
+  };
+
+  const handleNumberChange = (field: keyof TimingData, value: string) => {
+    const num = parseInt(value);
+    if (isNaN(num)) onUpdate({ ...data, [field]: 0 }); 
+    else onUpdate({ ...data, [field]: num });
   };
 
   return (
@@ -43,7 +51,6 @@ export const Step2Timing = ({ data, onUpdate }: Step2TimingProps) => {
 
       <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
         
-        {/* 1. Start Time */}
         <div className="space-y-2">
           <Label className="input-label">College Start Time</Label>
           <Input
@@ -54,41 +61,33 @@ export const Step2Timing = ({ data, onUpdate }: Step2TimingProps) => {
           />
         </div>
 
-        {/* 2. Slot Duration */}
         <div className="space-y-2">
           <Label className="input-label">Lecture Duration (mins)</Label>
           <Select
             value={data.slotDuration.toString()}
             onValueChange={(value) => onUpdate({ ...data, slotDuration: parseInt(value) })}
           >
-            <SelectTrigger className="h-12">
-              <SelectValue />
-            </SelectTrigger>
+            <SelectTrigger className="h-12"><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="45">45 minutes</SelectItem>
-              <SelectItem value="50">50 minutes</SelectItem>
-              <SelectItem value="60">60 minutes</SelectItem>
-              <SelectItem value="90">90 minutes</SelectItem>
+              {[45, 50, 60, 90].map(d => <SelectItem key={d} value={d.toString()}>{d} mins</SelectItem>)}
             </SelectContent>
           </Select>
         </div>
 
-        {/* 3. Recess Position (Calculated Time) */}
+        {/* FIXED RECESS SELECTOR */}
         <div className="space-y-2">
           <Label className="input-label">Recess Starts After</Label>
           <Select
             value={data.recessAfterSlot.toString()}
             onValueChange={(value) => onUpdate({ ...data, recessAfterSlot: parseInt(value) })}
           >
-            <SelectTrigger className="h-12">
-              <SelectValue />
-            </SelectTrigger>
+            <SelectTrigger className="h-12"><SelectValue /></SelectTrigger>
             <SelectContent>
-              {[1, 2, 3, 4, 5, 6].map((slot) => {
-                const timeAtSlot = calculateTime(data.startTime, slot * data.slotDuration);
+              {[3, 4, 5, 6].map((slot) => {
+                const breakStart = calculateTime(data.startTime, slot * data.slotDuration);
                 return (
                   <SelectItem key={slot} value={slot.toString()}>
-                    Slot {slot} (at {timeAtSlot})
+                    {slot} Lectures (Break at {breakStart})
                   </SelectItem>
                 );
               })}
@@ -96,7 +95,6 @@ export const Step2Timing = ({ data, onUpdate }: Step2TimingProps) => {
           </Select>
         </div>
 
-        {/* 4. Recess Duration */}
         <div className="space-y-2">
           <Label className="input-label">Recess Duration (mins)</Label>
           <div className="relative">
@@ -105,9 +103,10 @@ export const Step2Timing = ({ data, onUpdate }: Step2TimingProps) => {
               min={15}
               max={120}
               step={5}
-              value={data.recessDuration || 45} // Default to 45 if undefined
-              onChange={(e) => onUpdate({ ...data, recessDuration: parseInt(e.target.value) || 45 })}
+              value={data.recessDuration || ''}
+              onChange={(e) => handleNumberChange('recessDuration', e.target.value)}
               className="h-12 pl-10"
+              placeholder="45"
             />
             <Coffee className="w-4 h-4 text-muted-foreground absolute left-3 top-4" />
           </div>
@@ -116,14 +115,16 @@ export const Step2Timing = ({ data, onUpdate }: Step2TimingProps) => {
 
       <div className="mt-6">
         <div className="space-y-2 max-w-[200px]">
-          <Label className="input-label">Total Lectures per Day</Label>
+          <Label className="input-label">Total Grid Slots</Label>
+          <div className="text-xs text-muted-foreground mb-1">(Lectures + 1 Recess Slot)</div>
           <Input
             type="number"
-            min={4}
-            max={12}
-            value={data.totalSlots}
-            onChange={(e) => onUpdate({ ...data, totalSlots: parseInt(e.target.value) || 8 })}
+            min={5}
+            max={15}
+            value={data.totalSlots || ''} 
+            onChange={(e) => handleNumberChange('totalSlots', e.target.value)}
             className="h-12"
+            placeholder="e.g. 9"
           />
         </div>
       </div>
@@ -152,24 +153,29 @@ export const Step2Timing = ({ data, onUpdate }: Step2TimingProps) => {
         </div>
       </div>
 
-      {/* Dynamic Schedule Preview */}
-      <div className="mt-8 p-4 rounded-lg bg-accent/10 border border-accent/30">
-        <h4 className="font-display font-semibold text-sm mb-2">Schedule Preview</h4>
-        <div className="text-sm text-muted-foreground space-y-1">
-          <p>
-            • College Starts: <span className="gold-accent font-mono">{data.startTime}</span>
-          </p>
-          <p>
-            • Lectures: <span className="gold-accent">{data.totalSlots} slots</span> × {data.slotDuration} mins
-          </p>
-          <p>
-            • Recess: <span className="gold-accent">{data.recessDuration} mins</span> (Starts at {calculateTime(data.startTime, data.recessAfterSlot * data.slotDuration)})
-          </p>
-          <p>
-            • College Ends: <span className="gold-accent font-mono">
-              {calculateTime(data.startTime, (data.totalSlots * data.slotDuration) + (data.recessDuration || 45))}
-            </span>
-          </p>
+      {/* Visual Preview - Helps verify index */}
+      <div className="mt-8">
+        <Label className="input-label mb-2 block">Day Structure Preview</Label>
+        <div className="flex w-full h-12 rounded-lg overflow-hidden border border-border">
+          {Array.from({ length: data.totalSlots }).map((_, i) => {
+             const isRecess = i === data.recessAfterSlot;
+             return (
+               <div 
+                 key={i} 
+                 className={`flex-1 flex items-center justify-center text-xs font-mono border-r last:border-r-0 border-white/20
+                   ${isRecess ? 'bg-yellow-100 text-yellow-700 font-bold' : 'bg-accent/10 text-muted-foreground'}
+                 `}
+                 title={isRecess ? "Recess" : `Slot ${i}`}
+               >
+                 {isRecess ? "R" : (i < data.recessAfterSlot ? i + 1 : i)}
+               </div>
+             )
+          })}
+        </div>
+        <div className="flex justify-between text-xs text-muted-foreground mt-2 px-1">
+            <span>{calculateTime(data.startTime, 0)}</span>
+            <span>{calculateTime(data.startTime, (data.recessAfterSlot * data.slotDuration))} (Break)</span>
+            <span>{calculateTime(data.startTime, ((data.totalSlots - 1) * data.slotDuration) + (data.recessDuration || 0))}</span>
         </div>
       </div>
     </div>
